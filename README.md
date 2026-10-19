@@ -12,7 +12,7 @@ power and network LEDs, plus one per drive bay, behaving the way UGOS drives the
 It installs as a **TrueNAS Custom App** from a single YAML paste. It survives TrueNAS updates,
 because it never touches the read-only root filesystem.
 
-**Tested:** UGREEN DXP4800 Plus on TrueNAS SCALE (see the compatibility table below). Other
+**Tested:** UGREEN DXP4800 Plus on TrueNAS SCALE 25.04.2.6 (see the compatibility table below). Other
 DX/DXP models use the same controller and should work; please report back.
 
 ## Why not the existing options
@@ -97,7 +97,7 @@ may wire the ports differently — the DXP6800 Pro, for example, is known upstre
 
 | Model | OS | Status |
 | --- | --- | --- |
-| DXP4800 Plus | TrueNAS SCALE | ✅ tested |
+| DXP4800 Plus | TrueNAS SCALE 25.04.2.6 | ✅ tested |
 | other DX/DXP | any Linux with `i2c-dev` | untested — same controller per upstream; please open an issue with your `status` output |
 
 ## Running without Docker
