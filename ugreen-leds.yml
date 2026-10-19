@@ -1,0 +1,459 @@
+# ugreen-leds-truenas — drive the UGREEN DX/DXP front-panel LEDs (power, network, disk bays)
+# from a TrueNAS SCALE Custom App: steady while healthy, blinking on activity, red on a degraded
+# pool. No kernel module, so nothing to rebuild after a TrueNAS update.
+#
+# Install: load i2c-dev (System → Advanced → Init/Shutdown Scripts: Command `modprobe i2c-dev`,
+# Pre Init), then Apps → Discover Apps → Custom App → Install via YAML and paste this whole file.
+# The daemon is embedded under `configs:` so there is nothing to copy onto the NAS first; the
+# same code is also in ugreen_leds.py for running outside Docker. See README.md.
+#
+# No placeholders, no secrets: it is safe to paste this over the running app's YAML to update it.
+# Tunables are the UGREEN_* environment variables — all optional, defaults suit a 4-bay unit.
+
+services:
+  ugreen-leds:
+    image: python:3.13-alpine
+    container_name: ugreen-leds
+    command: ["python3", "-u", "/app/ugreen_leds.py"]
+    configs:
+      - source: ugreen_leds_py
+        target: /app/ugreen_leds.py
+    # Needs the host's /dev/i2c-* nodes and the I2C_SMBUS ioctl on them. `devices:` would
+    # need the bus number hard-coded (it's auto-detected from /sys/class/i2c-dev instead), and
+    # the alternative — a device-cgroup rule plus bind-mounting /dev — is more moving parts for
+    # the same effective access. Same posture as Scrutiny's disk passthrough.
+    privileged: true
+    # /sys/class/net is network-namespaced; the network LED needs the host's NICs, not a
+    # container veth. No ports are published.
+    network_mode: host
+    environment:
+      - UGREEN_BRIGHTNESS=64        # 0-255; UGOS runs the panel fairly dim
+      # - UGREEN_BAYS=ata1,ata2,ata3,ata4   # SATA port → bay 1..4; only change if `status`
+      #                                     # shows the wrong disk lighting the wrong bay
+      # - UGREEN_COLOR_DISK=255,255,255     # healthy bay colour (R,G,B); fail colour is red
+      # - UGREEN_POLL_SECONDS=0.1           # activity sampling interval
+      # - UGREEN_NET_MIN_BYTES=1            # traffic per 0.1 s sample before the network LED
+      #                                     # blinks; 65536 (~5 Mbit/s) ignores background chatter
+    # Python + stdlib idles around 12 MiB; the cap confines it on this 8 GB, no-swap box.
+    mem_limit: 64m
+    restart: unless-stopped
+
+configs:
+  ugreen_leds_py:
+    content: |
+      #!/usr/bin/env python3
+      """ugreen-leds — userspace front-panel LED daemon for UGREEN DXP NAS units.
+
+      Speaks to the LED controller (I2C address 0x3a on the Intel SMBus I801 adapter) through
+      the stock i2c-dev interface, using the wire protocol documented and reverse-engineered by
+      miskcoo/ugreen_leds_controller (cli/ugreen_leds.cpp and kmod/led-ugreen.c). No out-of-tree
+      kernel module, so nothing to rebuild when TrueNAS ships a new kernel.
+
+      Behaviour, mirroring UGOS:
+        power    steady
+        netdev   steady while a physical NIC has carrier, blinks on traffic like a switch
+                 port LED, off with no link
+        disk1-4  steady while a SATA disk is present in the bay, blinks on I/O, red while any
+                 ZFS pool is not ONLINE, off for an empty bay
+
+      Blinking is done by the controller's own hardware blink mode, so an I/O burst costs two
+      I2C writes (blink on, steady again), not one per poll.
+
+      Usage:  ugreen_leds.py            run the daemon (foreground, logs to stdout)
+              ugreen_leds.py status     print what it detects and each LED's controller state
+
+      Environment (all optional):
+        UGREEN_I2C_DEV          /dev/i2c-N to use; default auto-detects the SMBus I801 adapter
+        UGREEN_BAYS             SATA ports in bay order, default ata1,ata2,ata3,ata4
+        UGREEN_NET_IFACES       NICs for the network LED, default every interface with a device
+        UGREEN_BRIGHTNESS       0-255, default 64
+        UGREEN_COLOR_POWER / _NETDEV / _DISK / _FAIL   R,G,B; defaults white, white, white, red
+        UGREEN_POLL_SECONDS     activity sampling interval, default 0.1
+        UGREEN_HOLD_SECONDS     keep blinking this long after the last I/O, default 0.3
+        UGREEN_NET_MIN_BYTES    bytes per sample before the network LED counts it as traffic,
+                                default 1 (any packet, like a switch port LED); 65536 is
+                                ~5 Mbit/s at the default poll if you want background
+                                chatter ignored
+        UGREEN_RESCAN_SECONDS   disk/NIC/pool re-discovery and full LED re-sync, default 30
+        UGREEN_SYSFS / UGREEN_PROCFS   roots for /sys and /proc (test fixtures)
+        UGREEN_DRY_RUN=1        log I2C frames instead of sending them (no hardware needed)
+      """
+      import ctypes
+      import fcntl
+      import glob
+      import os
+      import re
+      import signal
+      import sys
+      import time
+
+      # ----------------------------------------------------------------- configuration
+      def _env(name, default):
+          return os.environ.get(name, default)
+
+
+      def _rgb(value):
+          parts = tuple(int(p) for p in value.split(","))
+          if len(parts) != 3 or not all(0 <= p <= 255 for p in parts):
+              raise SystemExit(f"bad colour {value!r}: want R,G,B with each 0-255")
+          return parts
+
+
+      SYSFS = _env("UGREEN_SYSFS", "/sys")
+      PROCFS = _env("UGREEN_PROCFS", "/proc")
+      I2C_DEV = _env("UGREEN_I2C_DEV", "")
+      DRY_RUN = _env("UGREEN_DRY_RUN", "") == "1"
+      BAYS = [b.strip() for b in _env("UGREEN_BAYS", "ata1,ata2,ata3,ata4").split(",")]
+      NET_IFACES = [n.strip() for n in _env("UGREEN_NET_IFACES", "").split(",") if n.strip()]
+      BRIGHTNESS = max(0, min(255, int(_env("UGREEN_BRIGHTNESS", "64"))))
+      COLOR_POWER = _rgb(_env("UGREEN_COLOR_POWER", "255,255,255"))
+      COLOR_NETDEV = _rgb(_env("UGREEN_COLOR_NETDEV", "255,255,255"))
+      COLOR_DISK = _rgb(_env("UGREEN_COLOR_DISK", "255,255,255"))
+      COLOR_FAIL = _rgb(_env("UGREEN_COLOR_FAIL", "255,0,0"))
+      POLL = float(_env("UGREEN_POLL_SECONDS", "0.1"))
+      HOLD = float(_env("UGREEN_HOLD_SECONDS", "0.3"))
+      NET_MIN_BYTES = max(1, int(_env("UGREEN_NET_MIN_BYTES", "1")))
+      RESCAN = float(_env("UGREEN_RESCAN_SECONDS", "30"))
+      BLINK_ON_MS, BLINK_OFF_MS = 100, 100   # upstream's ledtrig-oneshot defaults
+
+      LED_IDS = {"power": 0, "netdev": 1}
+      LED_IDS.update({f"disk{i}": 1 + i for i in range(1, 9)})
+      UGREEN_I2C_ADDR = 0x3A
+
+
+      def log(msg):
+          print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+      # ----------------------------------------------------------------- i2c-dev / SMBus
+      I2C_SLAVE = 0x0703
+      I2C_SMBUS = 0x0720
+      I2C_SMBUS_WRITE, I2C_SMBUS_READ = 0, 1
+      I2C_SMBUS_BYTE_DATA = 2
+      I2C_SMBUS_I2C_BLOCK_DATA = 8
+      I2C_SMBUS_BLOCK_MAX = 32
+
+
+      class _SmbusData(ctypes.Union):
+          _fields_ = [("byte", ctypes.c_uint8), ("word", ctypes.c_uint16),
+                      ("block", ctypes.c_uint8 * (I2C_SMBUS_BLOCK_MAX + 2))]
+
+
+      class _SmbusIoctlData(ctypes.Structure):
+          _fields_ = [("read_write", ctypes.c_uint8), ("command", ctypes.c_uint8),
+                      ("size", ctypes.c_uint32), ("data", ctypes.POINTER(_SmbusData))]
+
+
+      class I2CDevice:
+          """Minimal i2c-dev client: the three SMBus transfers the LED controller needs."""
+
+          def __init__(self, path, addr):
+              self.fd = os.open(path, os.O_RDWR)
+              fcntl.ioctl(self.fd, I2C_SLAVE, addr)
+
+          def _xfer(self, read_write, command, size, data):
+              msg = _SmbusIoctlData(read_write, command, size, ctypes.pointer(data))
+              fcntl.ioctl(self.fd, I2C_SMBUS, msg)
+
+          def write_i2c_block(self, command, payload):
+              data = _SmbusData()
+              data.block[0] = len(payload)
+              for i, b in enumerate(payload):
+                  data.block[i + 1] = b
+              self._xfer(I2C_SMBUS_WRITE, command, I2C_SMBUS_I2C_BLOCK_DATA, data)
+
+          def read_i2c_block(self, command, length):
+              data = _SmbusData()
+              data.block[0] = length
+              self._xfer(I2C_SMBUS_READ, command, I2C_SMBUS_I2C_BLOCK_DATA, data)
+              return bytes(data.block[1:1 + length])
+
+          def read_byte(self, command):
+              data = _SmbusData()
+              self._xfer(I2C_SMBUS_READ, command, I2C_SMBUS_BYTE_DATA, data)
+              return data.byte
+
+
+      def find_i2c_bus():
+          """Return the /dev/i2c-N behind the Intel SMBus, the way the upstream CLI finds it."""
+          if I2C_DEV:
+              return I2C_DEV
+          for entry in sorted(glob.glob(f"{SYSFS}/class/i2c-dev/i2c-*")):
+              try:
+                  with open(f"{entry}/device/name") as fh:
+                      name = fh.read().strip()
+              except OSError:
+                  continue
+              if name.startswith("SMBus I801 adapter"):
+                  return "/dev/" + os.path.basename(entry)
+          return None
+
+
+      # ----------------------------------------------------------------- LED controller
+      class Controller:
+          """The UGREEN LED controller's command set.
+
+          Every write is a 12-byte frame sent as an SMBus I2C-block write to register <led id>:
+            [id, 0xA0, 0x01, 0x00, 0x00, cmd, p1, p2, p3, p4, cksum_hi, cksum_lo]
+          where cksum is the plain sum of bytes 1..9 (the id is excluded — both upstream
+          implementations agree on that). Register 0x80 then reads 1 if the controller
+          accepted the command. Status is an 11-byte I2C-block read from 0x81 + id.
+          """
+
+          CMD_BRIGHTNESS, CMD_COLOR, CMD_ONOFF, CMD_BLINK, CMD_BREATH = 0x01, 0x02, 0x03, 0x04, 0x05
+          MODES = {0: "off", 1: "on", 2: "blink", 3: "breath"}
+
+          def __init__(self, dev):
+              self.dev = dev
+
+          def _command(self, led, cmd, params=()):
+              params = list(params) + [0] * (4 - len(params))
+              body = [0xA0, 0x01, 0x00, 0x00, cmd] + params
+              cksum = sum(body)
+              frame = [led] + body + [(cksum >> 8) & 0xFF, cksum & 0xFF]
+              if DRY_RUN:
+                  log("i2c write " + " ".join(f"{b:02x}" for b in frame))
+                  return True
+              self.dev.write_i2c_block(led, frame)
+              ok = self.dev.read_byte(0x80) == 1
+              if not ok:
+                  log(f"controller rejected cmd 0x{cmd:02x} for led {led}")
+              return ok
+
+          def on(self, led):
+              return self._command(led, self.CMD_ONOFF, [1])
+
+          def off(self, led):
+              return self._command(led, self.CMD_ONOFF, [0])
+
+          def brightness(self, led, value):
+              return self._command(led, self.CMD_BRIGHTNESS, [value])
+
+          def color(self, led, rgb):
+              return self._command(led, self.CMD_COLOR, list(rgb))
+
+          def blink(self, led, t_on_ms, t_off_ms):
+              cycle = (t_on_ms + t_off_ms) & 0xFFFF
+              return self._command(led, self.CMD_BLINK,
+                                   [cycle >> 8, cycle & 0xFF, t_on_ms >> 8, t_on_ms & 0xFF])
+
+          def status(self, led):
+              if DRY_RUN:
+                  return None
+              raw = self.dev.read_i2c_block(0x81 + led, 11)
+              if len(raw) != 11:
+                  return None
+              cksum = sum(raw[:9])
+              if cksum == 0 or cksum != (raw[9] << 8 | raw[10]):
+                  return None
+              t_cycle = raw[5] << 8 | raw[6]
+              t_on = raw[7] << 8 | raw[8]
+              return {"mode": self.MODES.get(raw[0], f"?{raw[0]}"), "brightness": raw[1],
+                      "rgb": (raw[2], raw[3], raw[4]), "t_on": t_on, "t_off": t_cycle - t_on}
+
+
+      class Led:
+          """Desired-state cache for one LED, so the bus only sees changes."""
+
+          def __init__(self, ctl, name):
+              self.ctl, self.name, self.id = ctl, name, LED_IDS[name]
+              self.mode = self.rgb = self.brightness = None
+
+          def apply(self, mode, rgb, force=False):
+              if force:
+                  self.mode = self.rgb = self.brightness = None
+              if self.brightness != BRIGHTNESS:
+                  self.ctl.brightness(self.id, BRIGHTNESS)
+                  self.brightness = BRIGHTNESS
+              if mode != "off" and self.rgb != rgb:
+                  self.ctl.color(self.id, rgb)
+                  self.rgb = rgb
+              if self.mode != mode:
+                  if mode == "off":
+                      self.ctl.off(self.id)
+                  elif mode == "on":
+                      self.ctl.on(self.id)
+                  else:
+                      self.ctl.blink(self.id, BLINK_ON_MS, BLINK_OFF_MS)
+                  self.mode = mode
+
+
+      # ----------------------------------------------------------------- host discovery
+      _ATA_RE = re.compile(r"/(ata\d+)/")
+
+
+      def scan_bays():
+          """Map bay number → block device for every SATA disk, by the ATA port in its sysfs path.
+
+          /sys/block/sdX → ../devices/pci.../ataN/host.../block/sdX. ataN is stable across
+          boots (it's the controller port), unlike /dev/sdX. The DXP4800 Plus wires ata1-4 to
+          bays 1-4 in order (upstream applies no override for it; the gist users confirm).
+          """
+          bays = {}
+          for path in sorted(glob.glob(f"{SYSFS}/block/sd*")):
+              try:
+                  target = os.readlink(path)
+              except OSError:
+                  continue
+              match = _ATA_RE.search(target)
+              if match and match.group(1) in BAYS:
+                  bays[BAYS.index(match.group(1)) + 1] = os.path.basename(path)
+          return bays
+
+
+      def scan_nics():
+          if NET_IFACES:
+              return NET_IFACES
+          return sorted(os.path.basename(p) for p in glob.glob(f"{SYSFS}/class/net/*")
+                        if os.path.exists(f"{p}/device"))
+
+
+      def _read(path, default=""):
+          try:
+              with open(path) as fh:
+                  return fh.read().strip()
+          except OSError:
+              return default
+
+
+      def disk_stat(dev):
+          return _read(f"{SYSFS}/block/{dev}/stat")
+
+
+      def net_bytes(nics):
+          return sum(int(_read(f"{SYSFS}/class/net/{n}/statistics/{d}_bytes", "0") or 0)
+                     for n in nics for d in ("rx", "tx"))
+
+
+      def net_carrier(nics):
+          return any(_read(f"{SYSFS}/class/net/{n}/carrier") == "1" for n in nics)
+
+
+      def degraded_pools():
+          return sorted(os.path.basename(os.path.dirname(p))
+                        for p in glob.glob(f"{PROCFS}/spl/kstat/zfs/*/state")
+                        if _read(p) != "ONLINE")
+
+
+      # ----------------------------------------------------------------- main loop
+      def open_controller():
+          bus = find_i2c_bus()
+          if bus is None and not DRY_RUN:
+              raise SystemExit("no SMBus I801 adapter under /sys/class/i2c-dev — is i2c-dev "
+                               "loaded? (Pre Init task: modprobe i2c-dev)")
+          log(f"LED controller: {bus or 'dry-run'} addr 0x{UGREEN_I2C_ADDR:02x}")
+          return Controller(None if DRY_RUN else I2CDevice(bus, UGREEN_I2C_ADDR))
+
+
+      def print_status(ctl):
+          bays, nics, bad = scan_bays(), scan_nics(), degraded_pools()
+          for bay in range(1, len(BAYS) + 1):
+              print(f"bay{bay} ({BAYS[bay - 1]}): {bays.get(bay, '- empty -')}")
+          print(f"network LED NICs: {', '.join(nics) or 'none'}; carrier: {net_carrier(nics)}")
+          print(f"pools not ONLINE: {', '.join(bad) or 'none'}")
+          for name in ["power", "netdev"] + [f"disk{i}" for i in range(1, len(BAYS) + 1)]:
+              print(f"{name:7s} {ctl.status(LED_IDS[name])}")
+
+
+      class Daemon:
+          def __init__(self, ctl):
+              self.ctl = ctl
+              self.leds = {n: Led(ctl, n) for n in ["power", "netdev"]
+                           + [f"disk{i}" for i in range(1, len(BAYS) + 1)]}
+              self.bays, self.nics, self.bad_pools = {}, [], []
+              self.last_stat, self.active_until = {}, {}
+              self.last_net = None
+              self.net_active_until = 0.0
+              self.stop = False
+              signal.signal(signal.SIGTERM, self._on_signal)
+              signal.signal(signal.SIGINT, self._on_signal)
+
+          def _on_signal(self, *_):
+              self.stop = True
+
+          def rescan(self):
+              bays, nics, bad = scan_bays(), scan_nics(), degraded_pools()
+              if bays != self.bays:
+                  log("bays: " + ", ".join(f"bay{b}={d}" for b, d in sorted(bays.items())))
+              if nics != self.nics:
+                  log("network LED NICs: " + (", ".join(nics) or "none"))
+              if bad != self.bad_pools:
+                  log("pools not ONLINE: " + (", ".join(bad) or "none"))
+              self.bays, self.nics, self.bad_pools = bays, nics, bad
+
+          def tick(self, now, force=False):
+              # A counter changing since the last sample means activity; the first sample
+              # of a device just seeds the baseline, so nothing blinks merely for appearing.
+              for bay, dev in self.bays.items():
+                  stat = disk_stat(dev)
+                  if dev in self.last_stat and stat != self.last_stat[dev]:
+                      self.active_until[dev] = now + HOLD
+                  self.last_stat[dev] = stat
+              # Network: like a switch port LED, any traffic blinks it. A NAS is rarely
+              # quiet, so NET_MIN_BYTES is there for anyone who wants chatter ignored.
+              net = net_bytes(self.nics)
+              if self.last_net is not None and net - self.last_net >= NET_MIN_BYTES:
+                  self.net_active_until = now + HOLD
+              self.last_net = net
+
+              disk_rgb = COLOR_FAIL if self.bad_pools else COLOR_DISK
+              self.leds["power"].apply("on", COLOR_POWER, force)
+              if not net_carrier(self.nics):
+                  self.leds["netdev"].apply("off", COLOR_NETDEV, force)
+              else:
+                  mode = "blink" if now < self.net_active_until else "on"
+                  self.leds["netdev"].apply(mode, COLOR_NETDEV, force)
+              for bay in range(1, len(BAYS) + 1):
+                  dev = self.bays.get(bay)
+                  if dev is None:
+                      self.leds[f"disk{bay}"].apply("off", disk_rgb, force)
+                  else:
+                      mode = "blink" if now < self.active_until.get(dev, 0) else "on"
+                      self.leds[f"disk{bay}"].apply(mode, disk_rgb, force)
+
+          def settle(self):
+              """Leave every LED steady on exit, so a stopped app doesn't freeze a blink."""
+              self.active_until.clear()
+              self.net_active_until = 0.0
+              self.tick(time.monotonic())
+
+          def run(self):
+              failures = 0
+              next_rescan = 0.0
+              while not self.stop:
+                  now = time.monotonic()
+                  try:
+                      force = now >= next_rescan
+                      if force:
+                          self.rescan()
+                          next_rescan = now + RESCAN
+                      self.tick(now, force)
+                      failures = 0
+                  except OSError as exc:
+                      failures += 1
+                      log(f"I2C error ({failures}): {exc}")
+                      if failures >= 10:
+                          raise SystemExit("giving up after 10 consecutive I2C errors")
+                      time.sleep(1)
+                      next_rescan = 0.0
+                      continue
+                  time.sleep(POLL)
+              log("stopping; leaving LEDs steady")
+              self.settle()
+
+
+      def main(argv):
+          if argv[1:] not in ([], ["status"]):
+              raise SystemExit(__doc__)
+          ctl = open_controller()
+          if argv[1:] == ["status"]:
+              print_status(ctl)
+              return 0
+          log(f"poll {POLL}s, hold {HOLD}s, rescan {RESCAN}s, brightness {BRIGHTNESS}, "
+              f"bays {','.join(BAYS)}")
+          Daemon(ctl).run()
+          return 0
+
+
+      if __name__ == "__main__":
+          sys.exit(main(sys.argv))

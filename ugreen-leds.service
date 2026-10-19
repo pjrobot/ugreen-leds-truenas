@@ -1,0 +1,20 @@
+# systemd unit for running the daemon outside Docker (Debian, Proxmox, Unraid-with-systemd…).
+# Not for TrueNAS: its root filesystem is read-only and replaced on every update — use the
+# Custom App (ugreen-leds.yml) there instead.
+#
+#   install -m 0755 ugreen_leds.py /usr/local/bin/ugreen_leds.py
+#   install -m 0644 ugreen-leds.service /etc/systemd/system/
+#   echo i2c-dev > /etc/modules-load.d/i2c-dev.conf && modprobe i2c-dev
+#   systemctl enable --now ugreen-leds
+[Unit]
+Description=UGREEN front-panel LED daemon
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/bin/python3 -u /usr/local/bin/ugreen_leds.py
+Restart=always
+RestartSec=5
+# Environment=UGREEN_BRIGHTNESS=64
+
+[Install]
+WantedBy=multi-user.target
