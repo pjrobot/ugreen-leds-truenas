@@ -201,6 +201,7 @@ configs:
           """
 
           CMD_BRIGHTNESS, CMD_COLOR, CMD_ONOFF, CMD_BLINK, CMD_BREATH = 0x01, 0x02, 0x03, 0x04, 0x05
+          CMD_RETRIES = 5
           MODES = {0: "off", 1: "on", 2: "blink", 3: "breath"}
 
           def __init__(self, dev):
@@ -214,11 +215,17 @@ configs:
               if DRY_RUN:
                   log("i2c write " + " ".join(f"{b:02x}" for b in frame))
                   return True
-              self.dev.write_i2c_block(led, frame)
-              ok = self.dev.read_byte(0x80) == 1
-              if not ok:
-                  log(f"controller rejected cmd 0x{cmd:02x} for led {led}")
-              return ok
+              # The controller is a slow MCU: it wants a moment before taking a frame and another
+              # before 0x80 reflects it, and it still drops the odd frame. Same pacing and retry
+              # budget as upstream's kmod (ugreen_led_change_state_robust).
+              for attempt in range(self.CMD_RETRIES):
+                  time.sleep(0.001 if attempt == 0 else 0.03)
+                  self.dev.write_i2c_block(led, frame)
+                  time.sleep(0.002)
+                  if self.dev.read_byte(0x80) == 1:
+                      return True
+              log(f"controller rejected cmd 0x{cmd:02x} for led {led} after {self.CMD_RETRIES} tries")
+              return False
 
           def on(self, led):
               return self._command(led, self.CMD_ONOFF, [1])
@@ -262,20 +269,20 @@ configs:
           def apply(self, mode, rgb, force=False):
               if force:
                   self.mode = self.rgb = self.brightness = None
-              if self.brightness != BRIGHTNESS:
-                  self.ctl.brightness(self.id, BRIGHTNESS)
+              # Only cache what the controller accepted, so a rejected command is resent next tick.
+              if self.brightness != BRIGHTNESS and self.ctl.brightness(self.id, BRIGHTNESS):
                   self.brightness = BRIGHTNESS
-              if mode != "off" and self.rgb != rgb:
-                  self.ctl.color(self.id, rgb)
+              if mode != "off" and self.rgb != rgb and self.ctl.color(self.id, rgb):
                   self.rgb = rgb
               if self.mode != mode:
                   if mode == "off":
-                      self.ctl.off(self.id)
+                      ok = self.ctl.off(self.id)
                   elif mode == "on":
-                      self.ctl.on(self.id)
+                      ok = self.ctl.on(self.id)
                   else:
-                      self.ctl.blink(self.id, BLINK_ON_MS, BLINK_OFF_MS)
-                  self.mode = mode
+                      ok = self.ctl.blink(self.id, BLINK_ON_MS, BLINK_OFF_MS)
+                  if ok:
+                      self.mode = mode
 
 
       # ----------------------------------------------------------------- host discovery
