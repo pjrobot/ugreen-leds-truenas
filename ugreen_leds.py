@@ -56,6 +56,9 @@ def _rgb(value):
     return parts
 
 
+# Bumped with each release tag (vX.Y.Z), so a log pasted into an issue says which code ran.
+VERSION = "0.2.0"
+
 SYSFS = _env("UGREEN_SYSFS", "/sys")
 PROCFS = _env("UGREEN_PROCFS", "/proc")
 I2C_DEV = _env("UGREEN_I2C_DEV", "")
@@ -436,8 +439,8 @@ def main(argv):
     if argv[1:] == ["status"]:
         print_status(ctl)
         return 0
-    log(f"poll {POLL}s, hold {HOLD}s, rescan {RESCAN}s, brightness {BRIGHTNESS}, "
-        f"bays {','.join(BAYS)}")
+    log(f"ugreen-leds {VERSION}: poll {POLL}s, hold {HOLD}s, rescan {RESCAN}s, "
+        f"brightness {BRIGHTNESS}, bays {','.join(BAYS)}")
     Daemon(ctl).run()
     return 0
 
