@@ -56,6 +56,9 @@ def _rgb(value):
     return parts
 
 
+# Bumped with each release tag (vX.Y.Z), so a log pasted into an issue says which code ran.
+VERSION = "0.2.0"
+
 SYSFS = _env("UGREEN_SYSFS", "/sys")
 PROCFS = _env("UGREEN_PROCFS", "/proc")
 I2C_DEV = _env("UGREEN_I2C_DEV", "")
@@ -181,7 +184,6 @@ class Controller:
             time.sleep(0.002)
             if self.dev.read_byte(0x80) == 1:
                 return True
-        log(f"controller rejected cmd 0x{cmd:02x} for led {led} after {self.CMD_RETRIES} tries")
         return False
 
     def on(self, led):
@@ -219,18 +221,31 @@ class Controller:
 class Led:
     """Desired-state cache for one LED, so the bus only sees changes."""
 
+    # Under load the controller still drops the odd command after all 5 tries; it is resent
+    # next tick and upstream's kmod only reports it with verbose=1. A LED that stays rejected
+    # this many ticks running is stuck, though, and worth a log line.
+    STUCK_TICKS = 10
+
     def __init__(self, ctl, name):
         self.ctl, self.name, self.id = ctl, name, LED_IDS[name]
         self.mode = self.rgb = self.brightness = None
+        self.rejected_ticks = 0
 
     def apply(self, mode, rgb, force=False):
         if force:
             self.mode = self.rgb = self.brightness = None
         # Only cache what the controller accepted, so a rejected command is resent next tick.
-        if self.brightness != BRIGHTNESS and self.ctl.brightness(self.id, BRIGHTNESS):
-            self.brightness = BRIGHTNESS
-        if mode != "off" and self.rgb != rgb and self.ctl.color(self.id, rgb):
-            self.rgb = rgb
+        rejected = []
+        if self.brightness != BRIGHTNESS:
+            if self.ctl.brightness(self.id, BRIGHTNESS):
+                self.brightness = BRIGHTNESS
+            else:
+                rejected.append("brightness")
+        if mode != "off" and self.rgb != rgb:
+            if self.ctl.color(self.id, rgb):
+                self.rgb = rgb
+            else:
+                rejected.append("colour")
         if self.mode != mode:
             if mode == "off":
                 ok = self.ctl.off(self.id)
@@ -240,6 +255,17 @@ class Led:
                 ok = self.ctl.blink(self.id, BLINK_ON_MS, BLINK_OFF_MS)
             if ok:
                 self.mode = mode
+            else:
+                rejected.append(mode)
+        if rejected:
+            self.rejected_ticks += 1
+            if self.rejected_ticks == self.STUCK_TICKS:
+                log(f"{self.name}: controller has rejected {', '.join(rejected)} "
+                    f"{self.STUCK_TICKS} ticks running; still retrying")
+        else:
+            if self.rejected_ticks >= self.STUCK_TICKS:
+                log(f"{self.name}: controller accepting commands again")
+            self.rejected_ticks = 0
 
 
 # ----------------------------------------------------------------- host discovery
@@ -413,8 +439,8 @@ def main(argv):
     if argv[1:] == ["status"]:
         print_status(ctl)
         return 0
-    log(f"poll {POLL}s, hold {HOLD}s, rescan {RESCAN}s, brightness {BRIGHTNESS}, "
-        f"bays {','.join(BAYS)}")
+    log(f"ugreen-leds {VERSION}: poll {POLL}s, hold {HOLD}s, rescan {RESCAN}s, "
+        f"brightness {BRIGHTNESS}, bays {','.join(BAYS)}")
     Daemon(ctl).run()
     return 0
 
