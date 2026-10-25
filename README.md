@@ -109,7 +109,9 @@ filesystem is reset on every update.
 
 `UGREEN_DRY_RUN=1` logs the I2C frames instead of sending them, and `UGREEN_SYSFS` /
 `UGREEN_PROCFS` point the discovery at a fixture tree, which is how it is tested without
-hardware.
+hardware. `make test` runs the unit tests in [`tests/`](tests/) against a simulated LED
+controller that speaks the wire protocol below (and drops commands on request, like the real
+one under load); `make check` runs them too and confirms the YAML embeds the same daemon.
 
 ## How it works
 
