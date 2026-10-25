@@ -12,7 +12,9 @@
 
 services:
   ugreen-leds:
-    image: python:3.13-alpine
+    # Stdlib only (3.8+), so track the current Python 3 rather than pin a minor version that
+    # eventually stops receiving image updates.
+    image: python:3-alpine
     container_name: ugreen-leds
     command: ["python3", "-u", "/app/ugreen_leds.py"]
     configs:
