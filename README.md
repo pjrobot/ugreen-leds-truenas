@@ -100,6 +100,7 @@ may wire the ports differently — the DXP6800 Pro, for example, is known upstre
 | --- | --- | --- |
 | DXP4800 Plus | TrueNAS SCALE 25.04.2.6 | ✅ tested |
 | DXP2800 | version not reported | ✅ reported working by a user ([#1](https://github.com/pjrobot/ugreen-leds-truenas/issues/1)) |
+| DXP 8800 Plus | TrueNAS SCALE (version not reported), app v0.2.0 | ✅ reported working by a user ([#1](https://github.com/pjrobot/ugreen-leds-truenas/issues/1#issuecomment-6675425700)); correct disk mapping required |
 | other DX/DXP | any Linux with `i2c-dev` | untested — same controller per upstream; please open an issue with your `status` output |
 
 ## Running without Docker
